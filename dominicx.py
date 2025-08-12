@@ -97,7 +97,7 @@ DOMINICX_BANNER = r'''
  /_\   ╚═════╝  ╚═════╝ ╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚═╝╚═╝ ╚═════╝╚═╝  ╚═╝ ╚═════╝   /_\ 
   _    _    _    _    _    _    _    _    _    _    _    _    _    _    _    _    _  
 {\o/}{\o/}{\o/}{\o/}{\o/}{\o/}{\o/}{\o/}{\o/}{\o/}{\o/}{\o/}{\o/}{\o/}{\o/}{\o/}{\o/}
- /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\ 
+ /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\  /_\ 
 
            DOMINICX Recon Framework - Trinitysec - Auto Install Edition
 '''
@@ -162,8 +162,20 @@ class ReconAuto:
         fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
         logger.addHandler(fh)
 
+    def check_tool_available(self, tool: str) -> bool:
+        """Check if a tool is available, including custom dirsearch location"""
+        if tool == 'dirsearch':
+            # Check if dirsearch is in PATH
+            if which('dirsearch'):
+                return True
+            # Check if dirsearch was cloned locally
+            dirsearch_path = self.outdir / 'dirsearch' / 'dirsearch.py'
+            return dirsearch_path.exists()
+        else:
+            return which(tool)
+
     def check_and_install_all(self) -> bool:
-        missing = [t for t in REQUIRED if not which(t)]
+        missing = [t for t in REQUIRED if not self.check_tool_available(t)]
         if not missing:
             print(Fore.GREEN + '[OK] All required tools present')
             return True
@@ -193,7 +205,7 @@ class ReconAuto:
                 print(Fore.RED + f'[ERROR] No auto-install rule for {m}. Install manually.')
                 return False
         # Re-check
-        still = [t for t in REQUIRED if not which(t)]
+        still = [t for t in REQUIRED if not self.check_tool_available(t)]
         if still:
             print(Fore.RED + '[ERROR] Some tools still missing after install: ' + ', '.join(still))
             logger.error('Tools still missing: %s', ','.join(still))
@@ -234,23 +246,9 @@ class ReconAuto:
                             fh.write(domain + '\n')
             except Exception:
                 logger.exception('urlscan parse')
-        # webarchive
-        web_out = self.outdir / 'webarchive.txt'
-        cp = run(['curl', '-s', f'http://web.archive.org/cdx/search/cdx?url=*.{self.target}/*&output=json&collapse=urlkey'])
-        if cp.returncode == 0 and cp.stdout:
-            try:
-                import json, re
-                arr = json.loads(cp.stdout)
-                with open(web_out, 'w') as fh:
-                    for row in arr[1:]:
-                        url = row[2]
-                        m = re.search(r'([a-zA-Z0-9._-]+\.)?'+re.escape(self.target), url)
-                        if m:
-                            fh.write(m.group(0) + '\n')
-            except Exception:
-                logger.exception('webarchive parse')
+
         # merge
-        all_files = [subfinder_out, crt_out, urlscan_out, web_out]
+        all_files = [subfinder_out, crt_out, urlscan_out]
         merged = set()
         for f in all_files:
             if f.exists():
@@ -327,20 +325,41 @@ class ReconAuto:
         dir_out.mkdir(exist_ok=True)
         kat_out = self.outdir / 'katana_out'
         kat_out.mkdir(exist_ok=True)
-        dirsearch_path = self.outdir / 'dirsearch' / 'dirsearch.py'
+        
+        # Determine how to run dirsearch
+        dirsearch_cmd = None
+        if which('dirsearch'):
+            dirsearch_cmd = ['dirsearch']
+            print(Fore.GREEN + '[INFO] Using dirsearch from PATH')
+        else:
+            dirsearch_path = self.outdir / 'dirsearch' / 'dirsearch.py'
+            if dirsearch_path.exists():
+                dirsearch_cmd = ['python3', str(dirsearch_path)]
+                print(Fore.GREEN + f'[INFO] Using local dirsearch: {dirsearch_path}')
+            else:
+                print(Fore.YELLOW + '[WARN] dirsearch not available, skipping directory search')
+                
         with open(alive, 'r') as fh:
             for line in fh:
                 url = line.strip()
                 if not url:
                     continue
-                name = url.replace('://', '_').replace('/', '_')
-                if dirsearch_path.exists():
-                    run(['python3', str(dirsearch_path), '-u', url, '-x', '403,404,500,400,502,503,429', '--random-agent', '-e', 'php,js,html', '-o', str(dir_out / f'{name}.txt')])
-                else:
-                    logger.info('dirsearch not present')
+                name = url.replace('://', '_').replace('/', '_').replace(':', '_')
+                
+                # Run dirsearch if available
+                if dirsearch_cmd:
+                    cmd = dirsearch_cmd + ['-u', url, '-x', '403,404,500,400,502,503,429', '--random-agent', '-e', 'php,js,html', '-o', str(dir_out / f'{name}.txt')]
+                    cp = run(cmd)
+                    if cp.returncode != 0:
+                        logger.warning('dirsearch failed for %s: %s', url, cp.stderr)
+                
+                # Run katana if available
                 if which('katana'):
-                    run(['katana', '-u', url, '-o', str(kat_out / f'{name}.txt')])
-        # merge dirsearch
+                    cp = run(['katana', '-u', url, '-o', str(kat_out / f'{name}.txt')])
+                    if cp.returncode != 0:
+                        logger.warning('katana failed for %s: %s', url, cp.stderr)
+                        
+        # merge dirsearch results
         merged_paths = self.outdir / 'dirs.txt'
         with open(merged_paths, 'w') as outf:
             for f in dir_out.glob('*.txt'):
@@ -360,8 +379,11 @@ class ReconAuto:
             print(Fore.YELLOW + '[WARN] No alive hosts, skipping nuclei')
             return
         if which('nuclei'):
-            run(['nuclei', '-l', str(alive), '-rl', '10', '-bs', '2', '-c', '2', '-as', '-severity', 'critical,high,medium', '-o', str(self.outdir / 'nuclei_results.txt')])
-            print(Fore.GREEN + '[OK] nuclei done')
+            cp = run(['nuclei', '-l', str(alive), '-rl', '10', '-bs', '2', '-c', '2', '-as', '-severity', 'critical,high,medium', '-o', str(self.outdir / 'nuclei_results.txt')])
+            if cp.returncode == 0:
+                print(Fore.GREEN + '[OK] nuclei done')
+            else:
+                logger.warning('nuclei failed: %s', cp.stderr)
         else:
             print(Fore.YELLOW + '[WARN] nuclei not installed, skipping')
 
